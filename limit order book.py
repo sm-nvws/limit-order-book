@@ -1,15 +1,24 @@
+import uuid
+import time
+import threading
 from collections import deque
 from enum import IntEnum
-import itertools
-import time
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+MAX_ORDER_QTY = 1_000_000 
+MAX_QUEUE_SIZE_PER_PRICE = 1000  
+PRICE_COLLAR = 100 
 
 class Side(IntEnum):
     BUY = 0
     SELL = 1
 
 class Order:
-    def __init__(self, order_id, side, price, qty, is_market=False):
-        self.order_id = order_id
+    def __init__(self, user_id, side, price, qty, is_market=False):
+        self.order_id = str(uuid.uuid4())  
+        self.user_id = user_id 
         self.side = side
         self.price = price
         self.qty = qty
@@ -25,35 +34,58 @@ class OrderBook:
         self.bids = {}  
         self.asks = {}  
         self.trades = []
-        self.order_id_counter = itertools.count()
         self.order_map = {}
 
         self.best_bid = None
         self.best_ask = None
 
-    def add_order(self, side, price, qty, is_market=False):
+        self.lock = threading.Lock()  
+
+    def add_order(self, user_id, side, price, qty, is_market=False):
+        # Input validation first
+        if not isinstance(side, Side):
+            logging.warning("Invalid side type.")
+            return None
+        if not isinstance(qty, int) or qty <= 0 or qty > MAX_ORDER_QTY:
+            logging.warning("Invalid quantity.")
+            return None
+        if not is_market and (price is None or not isinstance(price, (int, float))):
+            logging.warning("Invalid price for limit order.")
+            return None
+
         start = time.perf_counter()
 
-        if qty <= 0:
-            raise ValueError("Quantity must be positive.")
-        if not is_market and price is None:
-            raise ValueError("Price must be specified for limit orders.")
+        try:
+            with self.lock:
+                if is_market:
+                    if side == Side.BUY and self.best_ask is not None:
+                        price = self.best_ask + PRICE_COLLAR
+                    elif side == Side.SELL and self.best_bid is not None:
+                        price = self.best_bid - PRICE_COLLAR
+                    else:
+                        raise ValueError("Cannot execute market order with no opposing liquidity.")
 
-        order_id = next(self.order_id_counter)
-        order = Order(order_id, side, price, qty, is_market)
+                order = Order(user_id, side, price, qty, is_market)
+                self.match_order(order)
 
-        self.match_order(order)
+                if order.qty > 0 and not is_market:
+                    book = self.bids if side == Side.BUY else self.asks
+                    queue = book.setdefault(price, deque())
 
-        if order.qty > 0 and not is_market:
-            book = self.bids if side == Side.BUY else self.asks
-            queue = book.setdefault(price, deque())
-            queue.append(order)
-            self.order_map[order_id] = (order, queue)
-            self._update_best_prices_after_add(side, price)
+                    if len(queue) >= MAX_QUEUE_SIZE_PER_PRICE:
+                        raise OverflowError("Order queue at this price level is full.")
 
-        end = time.perf_counter()
-        print(f"Order {order_id} processed in {(end - start) * 1e6:.2f} µs")
-        return order_id
+                    queue.append(order)
+                    self.order_map[order.order_id] = (order, queue)
+                    self._update_best_prices_after_add(side, price)
+
+                end = time.perf_counter()
+                logging.info(f"Order {order.order_id} added in {(end - start) * 1e3:.2f} ms")
+                return order.order_id
+
+        except Exception as e:
+            logging.error(f"Order rejected: {e}")
+            return None
 
     def _update_best_prices_after_add(self, side, price):
         if side == Side.BUY:
@@ -67,87 +99,85 @@ class OrderBook:
         self.best_bid = max(self.bids.keys(), default=None)
         self.best_ask = min(self.asks.keys(), default=None)
 
-    def cancel_order(self, order_id):
-        data = self.order_map.pop(order_id, None)
-        if not data:
-            print(f"Order ID {order_id} not found.")
-            return False
-        order, queue = data
-        try:
-            queue.remove(order)
-            print(f"Canceled order ID {order_id}")
-            self._update_best_prices_after_remove()
+    def cancel_order(self, user_id, order_id):
+        with self.lock:
+            data = self.order_map.get(order_id)
+            if not data:
+                logging.warning(f"Order ID {order_id} not found.")
+                return False
+            order, queue = data
+
+            if order.user_id != user_id:
+                logging.warning(f"User {user_id} not authorized to cancel order {order_id}.")
+                return False
+
+            try:
+                queue.remove(order)
+                del self.order_map[order_id]
+                logging.info(f"Canceled order ID {order_id}")
+                self._update_best_prices_after_remove()
+                return True
+            except ValueError:
+                logging.warning(f"Order ID {order_id} already executed or not found.")
+                return False
+
+    def modify_order(self, user_id, order_id, new_qty=None, new_price=None):
+        with self.lock:
+            data = self.order_map.get(order_id)
+            if not data:
+                logging.warning(f"Cannot modify: order {order_id} not found.")
+                return False
+
+            order, _ = data
+            if order.user_id != user_id:
+                logging.warning(f"User {user_id} not authorized to modify order {order_id}.")
+                return False
+
+            if not self.cancel_order(user_id, order_id):
+                return False
+
+            updated_qty = new_qty if new_qty is not None else order.qty
+            updated_price = new_price if new_price is not None else order.price
+
+            new_id = self.add_order(user_id, order.side, updated_price, updated_qty)
+            if new_id is None:
+                logging.error(f"Failed to re-add modified order for user {user_id}.")
+                return False
+
             return True
-        except ValueError:
-            print(f"Order ID {order_id} already executed or not found in queue.")
-            return False
-
-    def modify_order(self, order_id, new_qty=None, new_price=None):
-        data = self.order_map.get(order_id)
-        if not data:
-            print(f"Cannot modify: order {order_id} not found.")
-            return False
-        order, _ = data
-        side = order.side
-        current_qty = order.qty
-        current_price = order.price
-
-        if not self.cancel_order(order_id):
-            return False
-
-        updated_qty = new_qty if new_qty is not None else current_qty
-        updated_price = new_price if new_price is not None else current_price
-        self.add_order(side, updated_price, updated_qty)
-        return True
 
     def match_order(self, order):
-        is_buy = order.side == Side.BUY
-        book = self.asks if is_buy else self.bids
-        comparator = (lambda o_price: order.price >= o_price) if is_buy else (lambda o_price: order.price <= o_price)
+        with self.lock:
+            book = self.asks if order.side == Side.BUY else self.bids
+            comparator = self._buy_comparator if order.side == Side.BUY else self._sell_comparator
 
-        while order.qty > 0 and book:
-            best_price = min(book.keys()) if is_buy else max(book.keys())
-            if not order.is_market and not comparator(best_price):
-                break
+            while order.qty > 0 and book:
+                best_price = min(book.keys()) if order.side == Side.BUY else max(book.keys())
+                if not order.is_market and not comparator(order.price, best_price):
+                    break
 
-            queue = book[best_price]
-            while queue and order.qty > 0:
-                top_order = queue[0]
-                traded_qty = min(order.qty, top_order.qty)
-                order.qty -= traded_qty
-                top_order.qty -= traded_qty
+                queue = book[best_price]
+                while queue and order.qty > 0:
+                    top_order = queue[0]
+                    traded_qty = min(order.qty, top_order.qty)
+                    order.qty -= traded_qty
+                    top_order.qty -= traded_qty
 
-                if is_buy:
+                    assert order.qty >= 0 and top_order.qty >= 0, "Order quantity went negative!"
+
                     self.trades.append((order.order_id, top_order.order_id, best_price, traded_qty))
-                else:
-                    self.trades.append((top_order.order_id, order.order_id, best_price, traded_qty))
 
-                if top_order.qty == 0:
-                    queue.popleft()
-                    self.order_map.pop(top_order.order_id, None)
+                    if top_order.qty == 0:
+                        queue.popleft()
+                        self.order_map.pop(top_order.order_id, None)
 
-            if not queue:
-                del book[best_price]
-                self._update_best_prices_after_remove()
+                if not queue:
+                    del book[best_price]
+                    self._update_best_prices_after_remove()
 
-    def print_book(self):
-        print("\n--- ORDER BOOK ---")
-        print("BIDS:")
-        for price in sorted(self.bids.keys(), reverse=True):
-            print(f"  {price}: {[o.qty for o in self.bids[price]]}")
-        print("ASKS:")
-        for price in sorted(self.asks.keys()):
-            print(f"  {price}: {[o.qty for o in self.asks[price]]}")
+    def _buy_comparator(self, buy_price, ask_price):
+        return buy_price >= ask_price
 
-    def print_spread(self):
-        print("\n--- SPREAD ---")
-        if self.best_bid is not None and self.best_ask is not None:
-            spread = self.best_ask - self.best_bid
-            print(f"Best Bid: {self.best_bid}, Best Ask: {self.best_ask}, Spread: {spread}")
-        else:
-            print("Not enough data to compute spread.")
+    def _sell_comparator(self, sell_price, bid_price):
+        return sell_price <= bid_price
 
-    def print_trades(self):
-        print("\n--- TRADES ---")
-        for buy_id, sell_id, price, qty in self.trades:
-            print(f"Buy {buy_id} ↔ Sell {sell_id} @ {price} x {qty}")
